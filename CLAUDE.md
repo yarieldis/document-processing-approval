@@ -50,16 +50,31 @@ document-processing-approval/
     │       ├── StubClassificationService.cs        # Stub: classifies by file extension
     │       ├── StubOcrService.cs                   # Stub: returns placeholder OCR text
     │       └── StubMetadataEnrichmentService.cs    # Stub: returns basic tags
-    └── DocumentProcessing.Functions/               # Compute host — 4 Azure Functions
-        ├── DocumentProcessing.Functions.csproj      # Worker SDK + Service Bus extension
-        ├── Program.cs                              # Host builder + DI registration
+    └── DocumentProcessing.Functions/               # Compute host — 5 Azure Functions + auth middleware
+        ├── DocumentProcessing.Functions.csproj      # Worker SDK + Service Bus + HTTP + JWT extensions
+        ├── Program.cs                              # Host builder + DI registration + middleware
         ├── host.json                               # Logging & runtime config
-        ├── local.settings.json                     # Local dev connection strings
+        ├── local.settings.json                     # Local dev connection strings + auth bypass
+        ├── Configuration/
+        │   └── AuthOptions.cs                      # Auth config POCO (Bypass, TenantId, ClientId, Issuer)
+        ├── Models/
+        │   └── IngestDocumentRequest.cs            # HTTP request body (no UploadedBy — from token)
+        ├── Middleware/
+        │   └── AuthenticationMiddleware.cs         # JWT validation + role check + dev bypass mode
         └── Functions/
+            ├── IngestDocument.cs                   # [POST] /api/documents — HTTP entry point with auth
             ├── OnDocumentUploaded.cs               # Trigger: classify-document sub → Classifies → DocumentClassified
             ├── ClassifyDocument.cs                 # Trigger: extract-content sub → Runs OCR → DocumentContentExtracted
             ├── ExtractDocumentContent.cs           # Trigger: enrich-metadata sub → Enriches → DocumentMetadataEnriched
             └── EnrichDocumentMetadata.cs           # Trigger: ready-for-review sub → Logs, hands off to Logic Apps (void)
+    └── DocumentProcessing.Tests/                   # Test project — 97 tests across all layers
+        ├── DocumentProcessing.Tests.csproj         # xUnit + Moq + coverlet
+        ├── Helpers/
+        ├── Contracts/
+        ├── Core/
+        ├── Functions/
+        ├── Middleware/
+        └── Integration/
 ```
 
 ## Quick Start
@@ -76,6 +91,13 @@ dotnet build DocumentProcessing.sln --no-restore
 ```
 
 Expected: 0 warnings, 0 errors.
+
+### Run Tests
+```bash
+dotnet test DocumentProcessing.sln
+```
+
+97 tests across all layers: contracts models, core stubs, Service Bus functions, HTTP trigger logic, auth middleware, and end-to-end pipeline integration.
 
 ### Run Functions Locally
 ```bash
@@ -115,7 +137,15 @@ All business logic lives behind interfaces (`IClassificationService`, `IOcrServi
 
 The Functions runtime runs in a separate process from the worker (`dotnet-isolated`). This is the modern model for .NET; the old in-process model is deprecated.
 
-### 5. Correlation ID for End-to-End Tracing
+### 5. JWT Authentication Middleware (HTTP entry point)
+
+The HTTP ingestion endpoint (`POST /api/documents`) is secured by custom `IFunctionsWorkerMiddleware`:
+
+- **Production mode** (`Authentication:Bypass = false`): Validates Azure AD Bearer JWT tokens. Checks the OIDC discovery endpoint for signing keys. Requires the `DocumentContributor` role claim. Returns 401 for missing/expired/invalid tokens, 403 for valid tokens without the role.
+- **Development mode** (`Authentication:Bypass = true`): Creates a synthetic `dev-user@local` identity with the `DocumentContributor` role. No token needed.
+- Identity flows from the validated token's `upn`/`preferred_username` claim into `DocumentMetadata.UploadedBy`, then propagates through the entire pipeline.
+
+### 6. Correlation ID for End-to-End Tracing
 
 Every `DocumentEvent` carries a `CorrelationId` (GUID) that stays constant across the entire pipeline. Combined with Application Insights, you can query "show me everything that happened for document X" across all functions, services, and Logic Apps.
 
@@ -129,7 +159,7 @@ Uploaded ──► Classified ──► ContentExtracted ──► MetadataEnric
 
 | State | Trigger | Function | Service Called | Output Event |
 |---|---|---|---|---|
-| Uploaded | Blob upload / HTTP | — (entry point) | — | `DocumentUploaded` |
+| Uploaded | HTTP POST | `IngestDocument` | `ServiceBusClient` | `DocumentUploaded` |
 | Classified | `classify-document` sub | `OnDocumentUploaded` | `IClassificationService` | `DocumentClassified` |
 | ContentExtracted | `extract-content` sub | `ClassifyDocument` | `IOcrService` | `DocumentContentExtracted` |
 | MetadataEnriched | `enrich-metadata` sub | `ExtractDocumentContent` | `IMetadataEnrichmentService` | `DocumentMetadataEnriched` |
@@ -141,6 +171,7 @@ Uploaded ──► Classified ──► ContentExtracted ──► MetadataEnric
 
 | Subscription | Filter Rule | Consumer |
 |---|---|---|
+| (entry point) | HTTP `POST /api/documents` | `IngestDocument` function publishes `DocumentUploaded` |
 | `classify-document` | `EventType = "DocumentUploaded"` | `OnDocumentUploaded` function |
 | `extract-content` | `EventType = "DocumentClassified"` | `ClassifyDocument` function |
 | `enrich-metadata` | `EventType = "DocumentContentExtracted"` | `ExtractDocumentContent` function |

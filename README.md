@@ -44,7 +44,7 @@ Uploaded ──► Classified ──► ContentExtracted ──► MetadataEnric
                                                                     └──► Rejected
 ```
 
-1. **Uploaded** — Document lands in blob storage; entry event published
+1. **Uploaded** — Document submitted via `POST /api/documents` (HTTP endpoint with JWT auth); entry event published
 2. **Classified** — Document type determined (Invoice, Contract, Report, etc.)
 3. **ContentExtracted** — OCR extracts text from the document
 4. **MetadataEnriched** — Entities, key-values, and structured data extracted
@@ -77,9 +77,14 @@ dotnet build DocumentProcessing.sln --no-restore
 # Run the Functions host locally
 cd src/DocumentProcessing.Functions
 func start
+
+# Run tests (97 tests across all layers)
+dotnet test DocumentProcessing.sln
 ```
 
 > **Note:** Without a reachable Azure Service Bus, the Functions host starts but triggers won't receive messages. Update `ServiceBusConnection` in `local.settings.json` to point to your Service Bus namespace.
+>
+> **Local auth bypass:** `Authentication__Bypass` is set to `true` in `local.settings.json`. The HTTP endpoint (`POST /api/documents`) accepts requests without a real token — a synthetic `dev-user@local` identity is used.
 
 ## Project Structure
 
@@ -105,15 +110,29 @@ src/
 │       ├── StubClassificationService.cs
 │       ├── StubOcrService.cs
 │       └── StubMetadataEnrichmentService.cs
-└── DocumentProcessing.Functions/      # Azure Functions host
-    ├── Program.cs                     # DI setup
+└── DocumentProcessing.Functions/      # Azure Functions host (5 functions)
+    ├── Program.cs                     # DI setup + middleware registration
     ├── host.json                      # Runtime config
-    ├── local.settings.json            # Local connection strings
+    ├── local.settings.json            # Local connection strings + auth bypass
+    ├── Configuration/
+    │   └── AuthOptions.cs             # JWT auth configuration
+    ├── Models/
+    │   └── IngestDocumentRequest.cs   # HTTP request body model
+    ├── Middleware/
+    │   └── AuthenticationMiddleware.cs # JWT validation + role enforcement
     └── Functions/
+        ├── IngestDocument.cs          # [POST] /api/documents — HTTP entry point
         ├── OnDocumentUploaded.cs      # classify-document subscription
         ├── ClassifyDocument.cs        # extract-content subscription
         ├── ExtractDocumentContent.cs  # enrich-metadata subscription
         └── EnrichDocumentMetadata.cs  # ready-for-review subscription
+├── DocumentProcessing.Tests/          # Test project — 97 tests
+│   ├── Contracts/                    # Model & message tests
+│   ├── Core/                         # Stub service tests
+│   ├── Functions/                    # Function unit tests
+│   ├── Middleware/                   # Auth middleware tests
+│   ├── Integration/                  # End-to-end pipeline tests
+│   └── Helpers/                      # Test utilities
 ```
 
 ## Key Design Decisions
@@ -121,7 +140,9 @@ src/
 - **Topic, not queues** — pub/sub enables adding new subscribers (audit, metrics, dashboards) without changing existing code
 - **Immutable records** — `with` expressions produce new `DocumentMetadata` at each stage; no mutation, no side effects
 - **Interfaces + stubs** — pipeline runs end-to-end without Azure AI resources; swap to real services via DI only
+- **JWT auth middleware** — HTTP entry point validates Azure AD Bearer tokens with role-based access (`DocumentContributor`); identity propagates through the pipeline via `UploadedBy`. Dev bypass mode for local development.
 - **Correlation ID** — a single GUID traces every step across Functions, Service Bus, and Logic Apps in Application Insights
+- **97 tests** — unit tests for contracts/stubs, function tests with mocked dependencies, and end-to-end pipeline integration tests
 
 ## Production Roadmap
 
